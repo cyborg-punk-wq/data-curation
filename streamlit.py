@@ -679,51 +679,187 @@ with st.sidebar:
 if page == "👑 Admin Panel":
     show_admin_panel()
 
-elif page == "🆕 New Task":
+# elif page == "🆕 New Task":
+#     st.title("🆕 Create New Task")
+    
+#     with st.form("task_form"):
+#         col1, col2 = st.columns(2)
+        
+#         with col1:
+#             client_id = st.text_input("Client ID", value="arabian-oasis-al-seer-uae")
+#             start_date = st.date_input("Start Date", value=datetime(2025, 8, 1))
+#             end_date = st.date_input("End Date", value=datetime(2025, 10, 31))
+#             photo_types = st.text_input("Photo Types", value="shelf")
+        
+#         with col2:
+#             category_types = st.text_input("Category Types", value="microwave-pop-corn")
+#             dataset_id = st.number_input("Dataset ID", value=384, min_value=1)
+#             version_name = st.text_input("Version Name (optional)", value="")
+#             sample_per_channel = st.number_input("Sample Per Channel", value=800, min_value=1)
+        
+#         channel_types = st.text_area("Channel Types", value="sup-mkt-wh-supply,sml-grcry-upto-20-m2", height=80)
+        
+#         submit = st.form_submit_button("▶️ Run Task", type="primary", use_container_width=True)
+    
+#     if submit:
+#         if not version_name:
+#             version_name = f"{category_types}_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
+        
+#         task_id = str(uuid.uuid4())
+        
+#         params = {
+#             "client_id": client_id,
+#             "start_date": start_date.strftime("%Y-%m-%d"),
+#             "end_date": end_date.strftime("%Y-%m-%d"),
+#             "photo_types": photo_types,
+#             "category_types": category_types,
+#             "channel_types": channel_types,
+#             "dataset_id": dataset_id,
+#             "version_name": version_name,
+#             "sample_per_channel": sample_per_channel
+#         }
+        
+#         create_task_in_db(task_id, st.session_state.username, st.session_state.user_email, params)
+        
+#         st.markdown("---")
+#         st.markdown(f"### ⚙️ Processing: `{task_id}`")
+#         run_task(task_id, params)
+
+
+# Initialize session state for metadata
+if 'metadata' not in st.session_state:
+    st.session_state.metadata = None
+if 'last_client_id' not in st.session_state:
+    st.session_state.last_client_id = ""
+
+def fetch_metadata(client_id):
+    """Fetch metadata from API based on client_id"""
+    try:
+        meta_info_url = f"https://public.infiviz.ai/api/v1/meta_info/?client_id={client_id}"
+        response = requests.get(meta_info_url)
+        response.raise_for_status()
+        meta_info = response.json()["data"]
+        
+        # Extract options
+        photo_types = [i["photo_type_name"] for i in meta_info["photo_types"]]
+        category_types = [i["category_type_name"] for i in meta_info["category_types"]]
+        channel_types = [i["channel_type_name"] for i in meta_info["channel_types"]]
+        
+        return {
+            "photo_types": photo_types,
+            "category_types": category_types,
+            "channel_types": channel_types
+        }
+    except Exception as e:
+        st.error(f"Error fetching metadata: {str(e)}")
+        return None
+
+# Page: New Task
+if page == "🆕 New Task":
     st.title("🆕 Create New Task")
     
+    # Client ID input and fetch button (OUTSIDE the form)
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        client_id_input = st.text_input(
+            "Client ID", 
+            value="arabian-oasis-al-seer-uae",
+            key="client_id_input"
+        )
+    with col_b:
+        st.write("")  # Spacer
+        st.write("")  # Spacer
+        fetch_button = st.button("🔄 Fetch Options", type="secondary", use_container_width=True)
+    
+    # Fetch metadata when button is clicked
+    if fetch_button:
+        with st.spinner("Fetching metadata..."):
+            st.session_state.metadata = fetch_metadata(client_id_input)
+            st.session_state.last_client_id = client_id_input
+            if st.session_state.metadata:
+                st.success("✓ Options loaded successfully!")
+    
+    # Check if metadata is available
+    if st.session_state.metadata:
+        photo_options = st.session_state.metadata["photo_types"]
+        category_options = st.session_state.metadata["category_types"]
+        channel_options = st.session_state.metadata["channel_types"]
+    else:
+        photo_options = []
+        category_options = []
+        channel_options = []
+        st.warning("⚠️ Please fetch options for the client ID first")
+    
+    # Main form with dynamic options
     with st.form("task_form"):
         col1, col2 = st.columns(2)
         
         with col1:
-            client_id = st.text_input("Client ID", value="arabian-oasis-al-seer-uae")
             start_date = st.date_input("Start Date", value=datetime(2025, 8, 1))
             end_date = st.date_input("End Date", value=datetime(2025, 10, 31))
-            photo_types = st.text_input("Photo Types", value="shelf")
+            
+            # Multi-select for photo types
+            photo_types_selected = st.multiselect(
+                "Photo Types",
+                options=photo_options,
+                default=None,
+                help="Select one or more photo types, or leave empty for all"
+            )
         
         with col2:
-            category_types = st.text_input("Category Types", value="microwave-pop-corn")
             dataset_id = st.number_input("Dataset ID", value=384, min_value=1)
             version_name = st.text_input("Version Name (optional)", value="")
             sample_per_channel = st.number_input("Sample Per Channel", value=800, min_value=1)
         
-        channel_types = st.text_area("Channel Types", value="sup-mkt-wh-supply,sml-grcry-upto-20-m2", height=80)
+        # Multi-select for category types
+        category_types_selected = st.multiselect(
+            "Category Types",
+            options=category_options,
+            default=None,
+            help="Select one or more categories, or leave empty for all"
+        )
+        
+        # Multi-select for channel types
+        channel_types_selected = st.multiselect(
+            "Channel Types",
+            options=channel_options,
+            default=None,
+            help="Select one or more channels, or leave empty for all"
+        )
         
         submit = st.form_submit_button("▶️ Run Task", type="primary", use_container_width=True)
     
     if submit:
-        if not version_name:
-            version_name = f"{category_types}_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
-        
-        task_id = str(uuid.uuid4())
-        
-        params = {
-            "client_id": client_id,
-            "start_date": start_date.strftime("%Y-%m-%d"),
-            "end_date": end_date.strftime("%Y-%m-%d"),
-            "photo_types": photo_types,
-            "category_types": category_types,
-            "channel_types": channel_types,
-            "dataset_id": dataset_id,
-            "version_name": version_name,
-            "sample_per_channel": sample_per_channel
-        }
-        
-        create_task_in_db(task_id, st.session_state.username, st.session_state.user_email, params)
-        
-        st.markdown("---")
-        st.markdown(f"### ⚙️ Processing: `{task_id}`")
-        run_task(task_id, params)
+        if not st.session_state.metadata:
+            st.error("❌ Please fetch metadata first before submitting")
+        else:
+            # Process selections - if empty, use all options
+            photo_types_final = ",".join(photo_types_selected) if photo_types_selected else ",".join(photo_options)
+            category_types_final = ",".join(category_types_selected) if category_types_selected else ",".join(category_options)
+            channel_types_final = ",".join(channel_types_selected) if channel_types_selected else ",".join(channel_options)
+            
+            if not version_name:
+                version_name = f"{category_types_final.split(',')[0]}_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
+            
+            task_id = str(uuid.uuid4())
+            
+            params = {
+                "client_id": client_id_input,
+                "start_date": start_date.strftime("%Y-%m-%d"),
+                "end_date": end_date.strftime("%Y-%m-%d"),
+                "photo_types": photo_types_final,
+                "category_types": category_types_final,
+                "channel_types": channel_types_final,
+                "dataset_id": dataset_id,
+                "version_name": version_name,
+                "sample_per_channel": sample_per_channel
+            }
+            
+            create_task_in_db(task_id, st.session_state.username, st.session_state.user_email, params)
+            
+            st.markdown("---")
+            st.markdown(f"### ⚙️ Processing: `{task_id}`")
+            run_task(task_id, params)
 
 elif page == "📊 My Tasks":
     st.title("📊 My Tasks")
