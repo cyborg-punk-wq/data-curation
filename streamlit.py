@@ -178,6 +178,151 @@ def show_login_page():
                     st.balloons()
                 else:
                     st.error(message)
+# ===== ADD THESE HELPER FUNCTIONS =====
+def cancel_task(task_id):
+    """Cancel a running task"""
+    if 'cancel_task_id' not in st.session_state:
+        st.session_state.cancel_task_id = None
+    st.session_state.cancel_task_id = task_id
+    update_task_status(task_id, "cancelled", error_message="Task cancelled by user")
+
+
+def is_task_cancelled(task_id):
+    """Check if task has been cancelled"""
+    return (hasattr(st.session_state, 'cancel_task_id') and 
+            st.session_state.cancel_task_id == task_id)
+
+
+# ===== MODIFIED TASK EXECUTION WITH CANCELLATION SUPPORT =====
+def run_task(task_id, params):
+    # Initialize cancellation state
+    if 'cancel_task_id' not in st.session_state:
+        st.session_state.cancel_task_id = None
+    
+    # Create cancel button in sidebar
+    cancel_container = st.sidebar.container()
+    with cancel_container:
+        st.markdown("---")
+        st.warning("⚙️ **Task Running**")
+        if st.button("🛑 Cancel Task", type="secondary", use_container_width=True, key=f"cancel_{task_id}"):
+            cancel_task(task_id)
+            st.error("Task cancelled!")
+            st.rerun()
+    
+    try:
+        update_task_status(task_id, "started")
+        
+        # Step 1: Fetch sessions
+        with st.status("**Step 1/3:** Fetching and sampling sessions...", expanded=True) as status:
+            if is_task_cancelled(task_id):
+                st.warning("❌ Task cancelled")
+                return False
+                
+            sampled_sessions = fetch_and_sample_sessions(
+                params["client_id"], params["start_date"], params["end_date"],
+                params["photo_types"], params["category_types"],
+                params["channel_types"], params["sample_per_channel"]
+            )
+            st.write(f"✅ Found **{len(sampled_sessions)}** sessions")
+            status.update(label=f"✅ Step 1/3: {len(sampled_sessions)} sessions", state="complete")
+        
+        # Step 2: Download responses with cancellation checks
+        with st.status("**Step 2/3:** Downloading processed outputs...", expanded=True) as status:
+            if is_task_cancelled(task_id):
+                st.warning("❌ Task cancelled")
+                status.update(label="❌ Step 2/3: Cancelled", state="error")
+                return False
+            
+            progress_bar = st.progress(0)
+            session_ids = [s["session_id"] for s in sampled_sessions]
+            responses = []
+            
+            for idx, sess_id in enumerate(session_ids):
+                # Check for cancellation every 10 iterations
+                if idx % 10 == 0 and is_task_cancelled(task_id):
+                    st.warning(f"❌ Task cancelled after {idx}/{len(session_ids)} downloads")
+                    status.update(label="❌ Step 2/3: Cancelled", state="error")
+                    return False
+                
+                resp = fetch_output_from_ai_controller(sess_id, params["client_id"])
+                if resp:
+                    responses.append(resp)
+                progress_bar.progress((idx + 1) / len(session_ids))
+            
+            st.write(f"✅ Downloaded **{len(responses)}** responses")
+            status.update(label=f"✅ Step 2/3: {len(responses)} responses", state="complete")
+        
+        # FIX: Handle zero responses edge case
+        if len(responses) == 0:
+            error_msg = "No valid responses downloaded from AI controller. Please check session IDs and client configuration."
+            update_task_status(task_id, "failed", error_message=error_msg)
+            st.error(f"❌ {error_msg}")
+            return False
+        
+        # Step 3: Upload to curation with cancellation checks
+        with st.status("**Step 3/3:** Uploading to curation...", expanded=True) as status:
+            if is_task_cancelled(task_id):
+                st.warning("❌ Task cancelled")
+                status.update(label="❌ Step 3/3: Cancelled", state="error")
+                return False
+            
+            progress_bar = st.progress(0)
+            cur = Curation()
+            cur.add_variables(params["dataset_id"], params["version_name"], CURATION_TOKEN, SOFTTAGS)
+            
+            success_count = 0
+            failed_sessions = []
+            
+            for idx, resp in enumerate(responses):
+                # Check for cancellation every 10 iterations
+                if idx % 10 == 0 and is_task_cancelled(task_id):
+                    st.warning(f"❌ Task cancelled after {success_count}/{len(responses)} uploads")
+                    status.update(label="❌ Step 3/3: Cancelled", state="error")
+                    return False
+                
+                try:
+                    cur.upload2curation(resp)
+                    success_count += 1
+                except Exception as e:
+                    session_id = resp.get('session_id', 'unknown')
+                    failed_sessions.append(session_id)
+                    st.warning(f"Failed session {session_id}: {str(e)}")
+                
+                progress_bar.progress((idx + 1) / len(responses))
+            
+            st.write(f"✅ Uploaded **{success_count}/{len(responses)}**")
+            if failed_sessions:
+                st.warning(f"⚠️ {len(failed_sessions)} sessions failed to upload")
+            status.update(label=f"✅ Step 3/3: Complete", state="complete")
+        
+        # Clear cancel state
+        st.session_state.cancel_task_id = None
+        
+        summary = {
+            "total_sessions": len(sampled_sessions),
+            "successful_responses": len(responses),
+            "uploaded_to_curation": success_count,
+            "failed_uploads": len(failed_sessions),
+            "version_name": params["version_name"]
+        }
+        update_task_status(task_id, "completed", result_summary=summary)
+        
+        st.success("🎉 **Task completed successfully!**")
+        st.json(summary)
+        st.balloons()
+        
+        return True
+        
+    except Exception as e:
+        error_msg = f"{str(e)}\n\n{traceback.format_exc()}"
+        update_task_status(task_id, "failed", error_message=error_msg)
+        st.error(f"❌ **Task failed:** {str(e)}")
+        with st.expander("View full error traceback"):
+            st.code(error_msg)
+        return False
+    finally:
+        # Clear the cancel button
+        cancel_container.empty()
 
 # ===== CHECK AUTHENTICATION =====
 if not st.session_state.authenticated:
@@ -514,12 +659,13 @@ elif page == "🆕 New Task":
         st.markdown("---")
         st.markdown(f"### ⚙️ Processing: `{task_id}`")
         run_task(task_id, params)
-
 elif page == "📊 My Tasks":
     st.title("📊 My Tasks")
     
-    if st.button("🔄 Refresh"):
-        st.rerun()
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        if st.button("🔄 Refresh"):
+            st.rerun()
     
     tasks = get_user_tasks(st.session_state.username)
     
@@ -527,7 +673,14 @@ elif page == "📊 My Tasks":
         st.info("No tasks yet!")
     else:
         for task in tasks:
-            status_emoji = {"queued": "⏳", "started": "🔄", "completed": "✅", "failed": "❌"}[task["status"]]
+            # Updated status emoji to include cancelled
+            status_emoji = {
+                "queued": "⏳", 
+                "started": "🔄", 
+                "completed": "✅", 
+                "failed": "❌",
+                "cancelled": "🛑"
+            }.get(task["status"], "❓")
             
             with st.expander(f"{status_emoji} {task['version_name']} - {task['status'].upper()} ({task['created_at'][:19]})"):
                 col1, col2 = st.columns(2)
@@ -545,12 +698,18 @@ elif page == "📊 My Tasks":
                         st.markdown(f"**Completed:** {task['completed_at'][:19]}")
                 
                 if task["status"] == "completed" and task.get("result_summary"):
+                    st.success("✅ Task Summary:")
                     st.json(task["result_summary"])
                 
+                if task["status"] == "cancelled":
+                    st.warning("🛑 This task was cancelled by the user.")
+                    if task.get("error_message"):
+                        st.info(task["error_message"])
+                
                 if task["status"] == "failed" and task.get("error_message"):
-                    st.error("Error Details:")
+                    st.error("❌ Error Details:")
                     st.code(task["error_message"])
-
+                    
 elif page == "📈 Summary":
     st.title("📈 Summary")
     
@@ -559,12 +718,23 @@ elif page == "📈 Summary":
     if tasks:
         completed = sum(1 for t in tasks if t["status"] == "completed")
         failed = sum(1 for t in tasks if t["status"] == "failed")
+        cancelled = sum(1 for t in tasks if t["status"] == "cancelled")
         in_progress = sum(1 for t in tasks if t["status"] in ["queued", "started"])
         
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("Total", len(tasks))
         col2.metric("✅ Completed", completed)
         col3.metric("🔄 In Progress", in_progress)
         col4.metric("❌ Failed", failed)
+        col5.metric("🛑 Cancelled", cancelled)
+        
+        # Add a chart if there are tasks
+        if len(tasks) > 0:
+            st.markdown("---")
+            import pandas as pd
+            
+            # Status distribution
+            status_counts = pd.DataFrame(tasks)['status'].value_counts()
+            st.bar_chart(status_counts)
     else:
         st.info("No tasks to summarize yet!")
