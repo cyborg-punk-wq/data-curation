@@ -6,3 +6,5 @@ rq
 sqlalchemy
 pandas
 bcrypt
+supabase
+st-supabase-connection
