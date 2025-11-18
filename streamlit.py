@@ -679,53 +679,6 @@ with st.sidebar:
 if page == "👑 Admin Panel":
     show_admin_panel()
 
-# elif page == "🆕 New Task":
-#     st.title("🆕 Create New Task")
-    
-#     with st.form("task_form"):
-#         col1, col2 = st.columns(2)
-        
-#         with col1:
-#             client_id = st.text_input("Client ID", value="arabian-oasis-al-seer-uae")
-#             start_date = st.date_input("Start Date", value=datetime(2025, 8, 1))
-#             end_date = st.date_input("End Date", value=datetime(2025, 10, 31))
-#             photo_types = st.text_input("Photo Types", value="shelf")
-        
-#         with col2:
-#             category_types = st.text_input("Category Types", value="microwave-pop-corn")
-#             dataset_id = st.number_input("Dataset ID", value=384, min_value=1)
-#             version_name = st.text_input("Version Name (optional)", value="")
-#             sample_per_channel = st.number_input("Sample Per Channel", value=800, min_value=1)
-        
-#         channel_types = st.text_area("Channel Types", value="sup-mkt-wh-supply,sml-grcry-upto-20-m2", height=80)
-        
-#         submit = st.form_submit_button("▶️ Run Task", type="primary", use_container_width=True)
-    
-#     if submit:
-#         if not version_name:
-#             version_name = f"{category_types}_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
-        
-#         task_id = str(uuid.uuid4())
-        
-#         params = {
-#             "client_id": client_id,
-#             "start_date": start_date.strftime("%Y-%m-%d"),
-#             "end_date": end_date.strftime("%Y-%m-%d"),
-#             "photo_types": photo_types,
-#             "category_types": category_types,
-#             "channel_types": channel_types,
-#             "dataset_id": dataset_id,
-#             "version_name": version_name,
-#             "sample_per_channel": sample_per_channel
-#         }
-        
-#         create_task_in_db(task_id, st.session_state.username, st.session_state.user_email, params)
-        
-#         st.markdown("---")
-#         st.markdown(f"### ⚙️ Processing: `{task_id}`")
-#         run_task(task_id, params)
-
-
 # Initialize session state for metadata
 if 'metadata' not in st.session_state:
     st.session_state.metadata = None
