@@ -55,7 +55,7 @@ def setup_logging():
 logger = setup_logging()
 
 # ===== PAGE CONFIG =====
-st.set_page_config(page_title="Session Processing Tool", page_icon="🔄", layout="wide")
+st.set_page_config(page_title="Automated Data Upload Tool (Built solely for DA Team)", page_icon="🔄", layout="wide")
 
 # ===== SUPABASE CONNECTION =====
 @st.cache_resource
@@ -223,6 +223,8 @@ def show_login_page():
                 st.error("Password must be at least 6 characters")
             elif "@" not in req_email:
                 st.error("Please enter a valid email")
+            elif "infilect.com" not in req_email:
+                st.error("You are using an Mail ID outside of the Infilect Domain ---> Gotcha Muhehe")
             else:
                 success, message = request_access(req_username, req_email, req_fullname, req_password)
                 
