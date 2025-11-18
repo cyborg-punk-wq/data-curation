@@ -1,7 +1,7 @@
 import streamlit as st
 from datetime import datetime
 from supabase import create_client
-import bcrypt
+import hashlib
 import traceback
 import json
 import uuid
@@ -39,14 +39,14 @@ if 'user_email' not in st.session_state:
 if 'user_role' not in st.session_state:
     st.session_state.user_role = None
 
-# ===== AUTHENTICATION FUNCTIONS =====
+# ===== PASSWORD FUNCTIONS (USING HASHLIB) =====
 def hash_password(password):
-    """Hash a password for storing"""
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    """Hash a password using SHA-256"""
+    return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
 def verify_password(password, password_hash):
     """Verify a password against its hash"""
-    return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+    return hash_password(password) == password_hash
 
 def authenticate_user(username, password):
     """Authenticate user credentials"""
@@ -367,42 +367,47 @@ def run_task(task_id, params):
             st.code(error_msg)
         return False
 
-# ===== ADMIN PANEL =====
+# ===== ADMIN PANEL (THIS IS WHERE YOU APPROVE REQUESTS!) =====
 def show_admin_panel():
-    st.title("👑 Admin Panel")
+    st.title("👑 Admin Panel - User Management")
     
     tab1, tab2 = st.tabs(["📋 Pending Requests", "👥 All Users"])
     
-    # PENDING REQUESTS TAB
+    # ===== THIS IS WHERE YOU APPROVE USERS! =====
     with tab1:
         st.markdown("### Pending Access Requests")
+        st.info("👇 Click **Approve** or **Reject** for each pending user below")
         
         pending = supabase.table("users").select("*").eq("status", "pending").order("requested_at", desc=True).execute()
         
         if not pending.data:
-            st.info("No pending requests")
+            st.success("✅ No pending requests - all users have been reviewed!")
         else:
+            st.warning(f"⏳ **{len(pending.data)} pending request(s)** waiting for your approval")
+            
             for user in pending.data:
-                with st.expander(f"👤 {user['full_name']} (@{user['username']})"):
-                    col1, col2 = st.columns(2)
+                with st.expander(f"👤 {user['full_name']} (@{user['username']})", expanded=True):
+                    col1, col2, col3 = st.columns([2, 2, 1])
                     
                     with col1:
                         st.markdown(f"**Email:** {user['email']}")
-                        st.markdown(f"**Requested:** {user['requested_at'][:19]}")
+                        st.markdown(f"**Username:** {user['username']}")
                     
                     with col2:
-                        col_a, col_b = st.columns(2)
-                        
-                        if col_a.button(f"✅ Approve", key=f"approve_{user['id']}", type="primary"):
+                        st.markdown(f"**Full Name:** {user['full_name']}")
+                        st.markdown(f"**Requested:** {user['requested_at'][:19]}")
+                    
+                    with col3:
+                        if st.button(f"✅ Approve", key=f"approve_{user['id']}", type="primary", use_container_width=True):
                             supabase.table("users").update({
                                 "status": "approved",
                                 "approved_at": datetime.now().isoformat(),
                                 "approved_by": st.session_state.username
                             }).eq("id", user['id']).execute()
-                            st.success(f"Approved {user['username']}")
+                            st.success(f"✅ Approved {user['username']}!")
                             st.rerun()
                         
-                        if col_b.button(f"❌ Reject", key=f"reject_{user['id']}"):
+                        if st.button(f"❌ Reject", key=f"reject_{user['id']}", use_container_width=True):
                             supabase.table("users").update({
                                 "status": "rejected"
                             }).eq("id", user['id']).execute()
@@ -415,10 +420,32 @@ def show_admin_panel():
         
         users = supabase.table("users").select("*").order("created_at", desc=True).execute()
         
-        import pandas as pd
-        df = pd.DataFrame(users.data)
-        df = df[['username', 'full_name', 'email', 'role', 'status', 'last_login', 'created_at']]
-        st.dataframe(df, use_container_width=True)
+        if users.data:
+            import pandas as pd
+            df = pd.DataFrame(users.data)
+            
+            # Select and reorder columns
+            display_columns = ['username', 'full_name', 'email', 'role', 'status', 'last_login', 'created_at']
+            df_display = df[display_columns]
+            
+            # Add color coding
+            def color_status(val):
+                if val == 'approved':
+                    return 'background-color: #d4edda'
+                elif val == 'pending':
+                    return 'background-color: #fff3cd'
+                elif val == 'rejected':
+                    return 'background-color: #f8d7da'
+                return ''
+            
+            st.dataframe(df_display, use_container_width=True)
+            
+            st.markdown(f"""
+            **Legend:**
+            - 🟢 Approved: {len(df[df['status'] == 'approved'])} users
+            - 🟡 Pending: {len(df[df['status'] == 'pending'])} users
+            - 🔴 Rejected: {len(df[df['status'] == 'rejected'])} users
+            """)
 
 # ===== SIDEBAR =====
 with st.sidebar:
@@ -539,3 +566,5 @@ elif page == "📈 Summary":
         col2.metric("✅ Completed", completed)
         col3.metric("🔄 In Progress", in_progress)
         col4.metric("❌ Failed", failed)
+    else:
+        st.info("No tasks to summarize yet!")
