@@ -5,11 +5,54 @@ import hashlib
 import traceback
 import json
 import uuid
+import logging
+from logging.handlers import RotatingFileHandler
+import os
 
 # Your original imports
 import requests
 from infiviz import Infiviz
 from curation import Curation
+
+# ===== LOGGING SETUP =====
+def setup_logging():
+    """Setup proper logging with file and console handlers"""
+    # Create logs directory if it doesn't exist
+    os.makedirs('logs', exist_ok=True)
+    
+    # Create logger
+    logger = logging.getLogger('session_processor')
+    logger.setLevel(logging.INFO)
+    
+    # Prevent duplicate handlers
+    if logger.handlers:
+        return logger
+    
+    # File handler with rotation (10MB max, keep 5 backups)
+    file_handler = RotatingFileHandler(
+        'logs/app.log',
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    file_handler.setLevel(logging.INFO)
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    # Formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+    )
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+logger = setup_logging()
 
 # ===== PAGE CONFIG =====
 st.set_page_config(page_title="Session Processing Tool", page_icon="🔄", layout="wide")
@@ -19,6 +62,7 @@ st.set_page_config(page_title="Session Processing Tool", page_icon="🔄", layou
 def init_supabase():
     supabase_url = st.secrets["connections"]["supabase"]["SUPABASE_URL"]
     supabase_key = st.secrets["connections"]["supabase"]["SUPABASE_KEY"]
+    logger.info("Initializing Supabase connection")
     return create_client(supabase_url, supabase_key)
 
 supabase = init_supabase()
@@ -38,8 +82,10 @@ if 'user_email' not in st.session_state:
     st.session_state.user_email = None
 if 'user_role' not in st.session_state:
     st.session_state.user_role = None
+if 'active_tasks' not in st.session_state:
+    st.session_state.active_tasks = {}
 
-# ===== PASSWORD FUNCTIONS (USING HASHLIB) =====
+# ===== PASSWORD FUNCTIONS =====
 def hash_password(password):
     """Hash a password using SHA-256"""
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
@@ -51,32 +97,37 @@ def verify_password(password, password_hash):
 def authenticate_user(username, password):
     """Authenticate user credentials"""
     try:
+        logger.info(f"Authentication attempt for user: {username}")
         response = supabase.table("users").select("*").eq("username", username).execute()
         
         if not response.data:
+            logger.warning(f"Authentication failed: Username not found - {username}")
             return False, "Username not found"
         
         user = response.data[0]
         
         if user['status'] != 'approved':
+            logger.warning(f"Authentication failed: Account status is {user['status']} for {username}")
             return False, f"Account is {user['status']}. Please contact admin for approval."
         
         if verify_password(password, user['password_hash']):
-            # Update last login
             supabase.table("users").update({
                 "last_login": datetime.now().isoformat()
             }).eq("username", username).execute()
-            
+            logger.info(f"User authenticated successfully: {username}")
             return True, user
         else:
+            logger.warning(f"Authentication failed: Incorrect password for {username}")
             return False, "Incorrect password"
     except Exception as e:
+        logger.error(f"Authentication error for {username}: {str(e)}", exc_info=True)
         return False, f"Error: {str(e)}"
 
 def request_access(username, email, full_name, password):
     """Submit access request"""
     try:
-        # Check if username or email already exists
+        logger.info(f"Access request from: {username} ({email})")
+        
         response = supabase.table("users").select("username, email").or_(
             f"username.eq.{username},email.eq.{email}"
         ).execute()
@@ -84,11 +135,12 @@ def request_access(username, email, full_name, password):
         if response.data:
             existing = response.data[0]
             if existing['username'] == username:
+                logger.warning(f"Access request failed: Username exists - {username}")
                 return False, "Username already exists"
             if existing['email'] == email:
+                logger.warning(f"Access request failed: Email exists - {email}")
                 return False, "Email already registered"
         
-        # Create new user with pending status
         supabase.table("users").insert({
             "username": username,
             "password_hash": hash_password(password),
@@ -97,12 +149,15 @@ def request_access(username, email, full_name, password):
             "status": "pending"
         }).execute()
         
+        logger.info(f"Access request created for: {username}")
         return True, "Access request submitted! Admin will review your request."
     except Exception as e:
+        logger.error(f"Error creating access request for {username}: {str(e)}", exc_info=True)
         return False, f"Error: {str(e)}"
 
 def logout():
     """Logout user"""
+    logger.info(f"User logged out: {st.session_state.username}")
     st.session_state.authenticated = False
     st.session_state.username = None
     st.session_state.user_email = None
@@ -120,7 +175,6 @@ def show_login_page():
     
     tab1, tab2 = st.tabs(["🔐 Login", "📝 Request Access"])
     
-    # LOGIN TAB
     with tab1:
         st.markdown("### Login to Your Account")
         
@@ -145,7 +199,6 @@ def show_login_page():
                 else:
                     st.error(f"❌ {result}")
     
-    # REQUEST ACCESS TAB
     with tab2:
         st.markdown("### Request Access")
         st.info("Fill in your details below. An admin will review and approve your request.")
@@ -178,57 +231,206 @@ def show_login_page():
                     st.balloons()
                 else:
                     st.error(message)
-# ===== ADD THESE HELPER FUNCTIONS =====
+
+# ===== TASK CANCELLATION FUNCTIONS =====
 def cancel_task(task_id):
     """Cancel a running task"""
-    if 'cancel_task_id' not in st.session_state:
-        st.session_state.cancel_task_id = None
-    st.session_state.cancel_task_id = task_id
+    logger.warning(f"Task cancellation requested: {task_id} by {st.session_state.username}")
+    if task_id in st.session_state.active_tasks:
+        st.session_state.active_tasks[task_id]['cancelled'] = True
     update_task_status(task_id, "cancelled", error_message="Task cancelled by user")
-
 
 def is_task_cancelled(task_id):
     """Check if task has been cancelled"""
-    return (hasattr(st.session_state, 'cancel_task_id') and 
-            st.session_state.cancel_task_id == task_id)
+    if task_id in st.session_state.active_tasks:
+        return st.session_state.active_tasks[task_id].get('cancelled', False)
+    return False
 
+# ===== TASK DATABASE FUNCTIONS =====
+def create_task_in_db(task_id, username, user_email, params):
+    """Create task record in database"""
+    try:
+        logger.info(f"Creating task {task_id} for user {username}")
+        logger.info(f"Task parameters: {json.dumps(params, default=str)}")
+        
+        # Check for concurrent tasks with same dataset_id and version_name
+        response = supabase.table("tasks").select("*").eq(
+            "dataset_id", params["dataset_id"]
+        ).eq("version_name", params["version_name"]).in_(
+            "status", ["queued", "started"]
+        ).execute()
+        
+        if response.data:
+            existing_task = response.data[0]
+            logger.warning(f"Concurrent task detected: {existing_task['task_id']} by {existing_task['username']}")
+            st.warning(f"⚠️ Warning: Another task is already running with the same dataset ({params['dataset_id']}) and version ({params['version_name']})")
+            st.warning(f"Started by: {existing_task['username']} at {existing_task['created_at'][:19]}")
+            st.info("This may cause data conflicts. Consider using a different version name.")
+        
+        supabase.table("tasks").insert({
+            "task_id": task_id,
+            "username": username,
+            "user_email": user_email,
+            "client_id": params["client_id"],
+            "start_date": params["start_date"],
+            "end_date": params["end_date"],
+            "photo_types": params["photo_types"],
+            "category_types": params["category_types"],
+            "channel_types": params["channel_types"],
+            "dataset_id": params["dataset_id"],
+            "version_name": params["version_name"],
+            "status": "queued"
+        }).execute()
+        
+        logger.info(f"Task created successfully: {task_id}")
+    except Exception as e:
+        logger.error(f"Error creating task {task_id}: {str(e)}", exc_info=True)
+        raise
 
-# ===== MODIFIED TASK EXECUTION WITH CANCELLATION SUPPORT =====
+def update_task_status(task_id, status, error_message=None, result_summary=None):
+    """Update task status in database"""
+    try:
+        logger.info(f"Updating task {task_id} status to: {status}")
+        
+        update_data = {"status": status}
+        
+        if status == "started":
+            update_data["started_at"] = datetime.now().isoformat()
+        elif status in ["completed", "failed", "cancelled"]:
+            update_data["completed_at"] = datetime.now().isoformat()
+        
+        if error_message:
+            update_data["error_message"] = error_message
+            logger.error(f"Task {task_id} error: {error_message}")
+        
+        if result_summary:
+            update_data["result_summary"] = result_summary
+            logger.info(f"Task {task_id} summary: {json.dumps(result_summary)}")
+        
+        supabase.table("tasks").update(update_data).eq("task_id", task_id).execute()
+    except Exception as e:
+        logger.error(f"Error updating task {task_id}: {str(e)}", exc_info=True)
+
+def get_user_tasks(username):
+    """Get all tasks for a user"""
+    try:
+        response = supabase.table("tasks").select("*").eq("username", username).order("created_at", desc=True).execute()
+        return response.data
+    except Exception as e:
+        logger.error(f"Error fetching tasks for {username}: {str(e)}", exc_info=True)
+        return []
+
+# ===== CORE PROCESSING FUNCTIONS =====
+def fetch_output_from_ai_controller(session_id, client_id):
+    """Fetch processed output from AI controller"""
+    payload = {"infiviz_session_id": session_id}
+    headers = {"APIKEY": APIKEY}
+    url = PROCESS_SESSION_URL_TEMPLATE.format(client_id, session_id)
+    
+    try:
+        result = requests.get(url, headers=headers, data=payload, timeout=30)
+        result.raise_for_status()
+        response_path = result.json()[0]["output"]
+        
+        try:
+            response = requests.get(response_path, timeout=30).json()
+            if response.get("status") == "success":
+                return response
+            else:
+                logger.warning(f"Session {session_id} returned non-success status")
+        except Exception as e:
+            logger.error(f"Failed to fetch JSON from {response_path} for session {session_id}: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error fetching output for session {session_id}: {str(e)}")
+    
+    return None
+
+def fetch_and_sample_sessions(client_id, start_date, end_date, photo_types, 
+                               category_types, channel_types, sample_per_channel):
+    """Fetch and sample sessions from Infiviz"""
+    try:
+        logger.info(f"Fetching sessions for client {client_id} from {start_date} to {end_date}")
+        
+        inf = Infiviz()
+        inf.add_variables(client_id, category_types, channel_types, photo_types, end_date, start_date)
+        inf.get_combinations(processed=True)
+        
+        all_data = inf.all_sessions
+        logger.info(f"Total sessions found: {len(all_data)}")
+
+        # Remove duplicates
+        seen = set()
+        filtered_data = []
+        for item in all_data:
+            sess_id = item["session_id"]
+            if sess_id not in seen:
+                seen.add(sess_id)
+                filtered_data.append(item)
+
+        # Group by category
+        category2sess_id = {}
+        for item in filtered_data:
+            cat_id = item["store_channel_id"]
+            category2sess_id.setdefault(cat_id, []).append(item["session_id"])
+
+        final_sess_ids = []
+        for val in category2sess_id.values():
+            final_sess_ids.extend(val)
+
+        sampled_data = [item for item in filtered_data if item["session_id"] in final_sess_ids]
+        logger.info(f"Total sessions sampled: {len(sampled_data)}")
+        
+        return sampled_data
+    except Exception as e:
+        logger.error(f"Error in fetch_and_sample_sessions: {str(e)}", exc_info=True)
+        raise
+
+# ===== TASK EXECUTION WITH PROPER CANCELLATION =====
 def run_task(task_id, params):
-    # Initialize cancellation state
-    if 'cancel_task_id' not in st.session_state:
-        st.session_state.cancel_task_id = None
+    """Execute task with proper logging and cancellation support"""
+    # Initialize task in active tasks
+    st.session_state.active_tasks[task_id] = {'cancelled': False}
     
     # Create cancel button in sidebar
     cancel_container = st.sidebar.container()
     with cancel_container:
         st.markdown("---")
         st.warning("⚙️ **Task Running**")
+        st.markdown(f"**Task ID:** `{task_id[:8]}...`")
         if st.button("🛑 Cancel Task", type="secondary", use_container_width=True, key=f"cancel_{task_id}"):
             cancel_task(task_id)
             st.error("Task cancelled!")
+            logger.warning(f"Task {task_id} cancelled by user button")
             st.rerun()
     
     try:
+        logger.info(f"Starting task execution: {task_id}")
         update_task_status(task_id, "started")
         
         # Step 1: Fetch sessions
         with st.status("**Step 1/3:** Fetching and sampling sessions...", expanded=True) as status:
             if is_task_cancelled(task_id):
+                logger.warning(f"Task {task_id} cancelled at Step 1")
                 st.warning("❌ Task cancelled")
                 return False
-                
-            sampled_sessions = fetch_and_sample_sessions(
-                params["client_id"], params["start_date"], params["end_date"],
-                params["photo_types"], params["category_types"],
-                params["channel_types"], params["sample_per_channel"]
-            )
-            st.write(f"✅ Found **{len(sampled_sessions)}** sessions")
-            status.update(label=f"✅ Step 1/3: {len(sampled_sessions)} sessions", state="complete")
+            
+            try:
+                sampled_sessions = fetch_and_sample_sessions(
+                    params["client_id"], params["start_date"], params["end_date"],
+                    params["photo_types"], params["category_types"],
+                    params["channel_types"], params["sample_per_channel"]
+                )
+                st.write(f"✅ Found **{len(sampled_sessions)}** sessions")
+                status.update(label=f"✅ Step 1/3: {len(sampled_sessions)} sessions", state="complete")
+                logger.info(f"Task {task_id}: Step 1 complete - {len(sampled_sessions)} sessions")
+            except Exception as e:
+                logger.error(f"Task {task_id}: Step 1 failed - {str(e)}", exc_info=True)
+                raise
         
-        # Step 2: Download responses with cancellation checks
+        # Step 2: Download responses
         with st.status("**Step 2/3:** Downloading processed outputs...", expanded=True) as status:
             if is_task_cancelled(task_id):
+                logger.warning(f"Task {task_id} cancelled at Step 2")
                 st.warning("❌ Task cancelled")
                 status.update(label="❌ Step 2/3: Cancelled", state="error")
                 return False
@@ -236,10 +438,12 @@ def run_task(task_id, params):
             progress_bar = st.progress(0)
             session_ids = [s["session_id"] for s in sampled_sessions]
             responses = []
+            failed_count = 0
             
             for idx, sess_id in enumerate(session_ids):
                 # Check for cancellation every 10 iterations
                 if idx % 10 == 0 and is_task_cancelled(task_id):
+                    logger.warning(f"Task {task_id} cancelled after {idx}/{len(session_ids)} downloads")
                     st.warning(f"❌ Task cancelled after {idx}/{len(session_ids)} downloads")
                     status.update(label="❌ Step 2/3: Cancelled", state="error")
                     return False
@@ -247,21 +451,27 @@ def run_task(task_id, params):
                 resp = fetch_output_from_ai_controller(sess_id, params["client_id"])
                 if resp:
                     responses.append(resp)
+                else:
+                    failed_count += 1
+                
                 progress_bar.progress((idx + 1) / len(session_ids))
             
-            st.write(f"✅ Downloaded **{len(responses)}** responses")
+            logger.info(f"Task {task_id}: Step 2 complete - {len(responses)} successful, {failed_count} failed")
+            st.write(f"✅ Downloaded **{len(responses)}** responses ({failed_count} failed)")
             status.update(label=f"✅ Step 2/3: {len(responses)} responses", state="complete")
         
-        # FIX: Handle zero responses edge case
+        # Handle zero responses
         if len(responses) == 0:
-            error_msg = "No valid responses downloaded from AI controller. Please check session IDs and client configuration."
+            error_msg = "No valid responses downloaded from AI controller"
+            logger.error(f"Task {task_id}: {error_msg}")
             update_task_status(task_id, "failed", error_message=error_msg)
             st.error(f"❌ {error_msg}")
             return False
         
-        # Step 3: Upload to curation with cancellation checks
+        # Step 3: Upload to curation
         with st.status("**Step 3/3:** Uploading to curation...", expanded=True) as status:
             if is_task_cancelled(task_id):
+                logger.warning(f"Task {task_id} cancelled at Step 3")
                 st.warning("❌ Task cancelled")
                 status.update(label="❌ Step 3/3: Cancelled", state="error")
                 return False
@@ -276,6 +486,7 @@ def run_task(task_id, params):
             for idx, resp in enumerate(responses):
                 # Check for cancellation every 10 iterations
                 if idx % 10 == 0 and is_task_cancelled(task_id):
+                    logger.warning(f"Task {task_id} cancelled after {success_count}/{len(responses)} uploads")
                     st.warning(f"❌ Task cancelled after {success_count}/{len(responses)} uploads")
                     status.update(label="❌ Step 3/3: Cancelled", state="error")
                     return False
@@ -286,17 +497,20 @@ def run_task(task_id, params):
                 except Exception as e:
                     session_id = resp.get('session_id', 'unknown')
                     failed_sessions.append(session_id)
+                    logger.error(f"Failed to upload session {session_id}: {str(e)}")
                     st.warning(f"Failed session {session_id}: {str(e)}")
                 
                 progress_bar.progress((idx + 1) / len(responses))
             
+            logger.info(f"Task {task_id}: Step 3 complete - {success_count} uploaded, {len(failed_sessions)} failed")
             st.write(f"✅ Uploaded **{success_count}/{len(responses)}**")
             if failed_sessions:
                 st.warning(f"⚠️ {len(failed_sessions)} sessions failed to upload")
             status.update(label=f"✅ Step 3/3: Complete", state="complete")
         
         # Clear cancel state
-        st.session_state.cancel_task_id = None
+        if task_id in st.session_state.active_tasks:
+            del st.session_state.active_tasks[task_id]
         
         summary = {
             "total_sessions": len(sampled_sessions),
@@ -305,6 +519,8 @@ def run_task(task_id, params):
             "failed_uploads": len(failed_sessions),
             "version_name": params["version_name"]
         }
+        
+        logger.info(f"Task {task_id} completed successfully: {json.dumps(summary)}")
         update_task_status(task_id, "completed", result_summary=summary)
         
         st.success("🎉 **Task completed successfully!**")
@@ -315,210 +531,24 @@ def run_task(task_id, params):
         
     except Exception as e:
         error_msg = f"{str(e)}\n\n{traceback.format_exc()}"
+        logger.error(f"Task {task_id} failed: {error_msg}")
         update_task_status(task_id, "failed", error_message=error_msg)
         st.error(f"❌ **Task failed:** {str(e)}")
         with st.expander("View full error traceback"):
             st.code(error_msg)
         return False
     finally:
-        # Clear the cancel button
+        # Clear the cancel button and active task
         cancel_container.empty()
+        if task_id in st.session_state.active_tasks:
+            del st.session_state.active_tasks[task_id]
 
-# ===== CHECK AUTHENTICATION =====
-if not st.session_state.authenticated:
-    show_login_page()
-    st.stop()
-
-# ===== YOUR ORIGINAL FUNCTIONS (NO CHANGES) =====
-def fetch_output_from_ai_controller(session_id, client_id):
-    payload = {"infiviz_session_id": session_id}
-    headers = {"APIKEY": APIKEY}
-    url = PROCESS_SESSION_URL_TEMPLATE.format(client_id, session_id)
-    
-    try:
-        result = requests.get(url, headers=headers, data=payload)
-        response_path = result.json()[0]["output"]
-        try:
-            response = requests.get(response_path).json()
-        except Exception:
-            print(f"Failed to fetch JSON from {response_path} for session {session_id}")
-        if response.get("status") == "success":
-            return response
-    except Exception:
-        traceback.print_exc()
-    return None
-
-def fetch_and_sample_sessions(client_id, start_date, end_date, photo_types, 
-                               category_types, channel_types, sample_per_channel):
-    inf = Infiviz()
-    inf.add_variables(client_id, category_types, channel_types, photo_types, end_date, start_date)
-    print("Fetching combinations from Infiviz...")
-    inf.get_combinations(processed=True)
-    
-    all_data = inf.all_sessions
-    print(f"Total sessions found: {len(all_data)}")
-
-    seen = set()
-    filtered_data = []
-    for item in all_data:
-        sess_id = item["session_id"]
-        if sess_id not in seen:
-            seen.add(sess_id)
-            filtered_data.append(item)
-
-    category2sess_id = {}
-    for item in filtered_data:
-        cat_id = item["store_channel_id"]
-        category2sess_id.setdefault(cat_id, []).append(item["session_id"])
-
-    final_sess_ids = []
-    for val in category2sess_id.values():
-        final_sess_ids.extend(val)
-
-    sampled_data = [item for item in filtered_data if item["session_id"] in final_sess_ids]
-    print(f"Total sessions sampled: {len(sampled_data)}")
-    
-    return sampled_data
-
-def download_responses(sampled_sessions, client_id):
-    session_ids = [s["session_id"] for s in sampled_sessions]
-    print(f"Downloading processed outputs for {len(session_ids)} sessions...")
-    responses = []
-
-    for sess_id in session_ids:
-        resp = fetch_output_from_ai_controller(sess_id, client_id)
-        if resp:
-            responses.append(resp)
-    
-    print(f"Total successful responses: {len(responses)}")
-    return responses
-
-def upload_to_curation(responses, dataset_id, version_name):
-    cur = Curation()
-    cur.add_variables(dataset_id, version_name, CURATION_TOKEN, SOFTTAGS)
-
-    print(f"Uploading {len(responses)} responses to Curation...")
-    success_count = 0
-    for resp in responses:
-        try:
-            cur.upload2curation(resp)
-            success_count += 1
-        except Exception:
-            print(f"Failed to upload session {resp.get('session_id')}")
-            traceback.print_exc()
-    
-    return success_count
-
-# ===== TASK DATABASE FUNCTIONS =====
-def create_task_in_db(task_id, username, user_email, params):
-    supabase.table("tasks").insert({
-        "task_id": task_id,
-        "username": username,
-        "user_email": user_email,
-        "client_id": params["client_id"],
-        "start_date": params["start_date"],
-        "end_date": params["end_date"],
-        "photo_types": params["photo_types"],
-        "category_types": params["category_types"],
-        "channel_types": params["channel_types"],
-        "dataset_id": params["dataset_id"],
-        "version_name": params["version_name"],
-        "status": "queued"
-    }).execute()
-
-def update_task_status(task_id, status, error_message=None, result_summary=None):
-    update_data = {"status": status}
-    
-    if status == "started":
-        update_data["started_at"] = datetime.now().isoformat()
-    elif status in ["completed", "failed"]:
-        update_data["completed_at"] = datetime.now().isoformat()
-    
-    if error_message:
-        update_data["error_message"] = error_message
-    if result_summary:
-        update_data["result_summary"] = result_summary
-    
-    supabase.table("tasks").update(update_data).eq("task_id", task_id).execute()
-
-def get_user_tasks(username):
-    response = supabase.table("tasks").select("*").eq("username", username).order("created_at", desc=True).execute()
-    return response.data
-
-# ===== TASK EXECUTION =====
-def run_task(task_id, params):
-    try:
-        update_task_status(task_id, "started")
-        
-        with st.status("**Step 1/3:** Fetching and sampling sessions...", expanded=True) as status:
-            sampled_sessions = fetch_and_sample_sessions(
-                params["client_id"], params["start_date"], params["end_date"],
-                params["photo_types"], params["category_types"],
-                params["channel_types"], params["sample_per_channel"]
-            )
-            st.write(f"✅ Found **{len(sampled_sessions)}** sessions")
-            status.update(label=f"✅ Step 1/3: {len(sampled_sessions)} sessions", state="complete")
-        
-        with st.status("**Step 2/3:** Downloading processed outputs...", expanded=True) as status:
-            progress_bar = st.progress(0)
-            session_ids = [s["session_id"] for s in sampled_sessions]
-            responses = []
-            
-            for idx, sess_id in enumerate(session_ids):
-                resp = fetch_output_from_ai_controller(sess_id, params["client_id"])
-                if resp:
-                    responses.append(resp)
-                progress_bar.progress((idx + 1) / len(session_ids))
-            
-            st.write(f"✅ Downloaded **{len(responses)}** responses")
-            status.update(label=f"✅ Step 2/3: {len(responses)} responses", state="complete")
-        
-        with st.status("**Step 3/3:** Uploading to curation...", expanded=True) as status:
-            progress_bar = st.progress(0)
-            cur = Curation()
-            cur.add_variables(params["dataset_id"], params["version_name"], CURATION_TOKEN, SOFTTAGS)
-            
-            success_count = 0
-            for idx, resp in enumerate(responses):
-                try:
-                    cur.upload2curation(resp)
-                    success_count += 1
-                except Exception:
-                    st.warning(f"Failed session {resp.get('session_id')}")
-                progress_bar.progress((idx + 1) / len(responses))
-            
-            st.write(f"✅ Uploaded **{success_count}/{len(responses)}**")
-            status.update(label=f"✅ Step 3/3: Complete", state="complete")
-        
-        summary = {
-            "total_sessions": len(sampled_sessions),
-            "successful_responses": len(responses),
-            "uploaded_to_curation": success_count,
-            "version_name": params["version_name"]
-        }
-        update_task_status(task_id, "completed", result_summary=summary)
-        
-        st.success("🎉 **Task completed successfully!**")
-        st.json(summary)
-        st.balloons()
-        
-        return True
-        
-    except Exception as e:
-        error_msg = f"{str(e)}\n\n{traceback.format_exc()}"
-        update_task_status(task_id, "failed", error_message=error_msg)
-        st.error(f"❌ **Task failed:** {str(e)}")
-        with st.expander("View error"):
-            st.code(error_msg)
-        return False
-
-# ===== ADMIN PANEL (THIS IS WHERE YOU APPROVE REQUESTS!) =====
+# ===== ADMIN PANEL =====
 def show_admin_panel():
     st.title("👑 Admin Panel - User Management")
     
-    tab1, tab2 = st.tabs(["📋 Pending Requests", "👥 All Users"])
+    tab1, tab2, tab3 = st.tabs(["📋 Pending Requests", "👥 All Users", "📜 View Logs"])
     
-    # ===== THIS IS WHERE YOU APPROVE USERS! =====
     with tab1:
         st.markdown("### Pending Access Requests")
         st.info("👇 Click **Approve** or **Reject** for each pending user below")
@@ -549,6 +579,7 @@ def show_admin_panel():
                                 "approved_at": datetime.now().isoformat(),
                                 "approved_by": st.session_state.username
                             }).eq("id", user['id']).execute()
+                            logger.info(f"User {user['username']} approved by {st.session_state.username}")
                             st.success(f"✅ Approved {user['username']}!")
                             st.rerun()
                         
@@ -556,10 +587,10 @@ def show_admin_panel():
                             supabase.table("users").update({
                                 "status": "rejected"
                             }).eq("id", user['id']).execute()
+                            logger.info(f"User {user['username']} rejected by {st.session_state.username}")
                             st.warning(f"Rejected {user['username']}")
                             st.rerun()
     
-    # ALL USERS TAB
     with tab2:
         st.markdown("### All Users")
         
@@ -569,19 +600,8 @@ def show_admin_panel():
             import pandas as pd
             df = pd.DataFrame(users.data)
             
-            # Select and reorder columns
             display_columns = ['username', 'full_name', 'email', 'role', 'status', 'last_login', 'created_at']
             df_display = df[display_columns]
-            
-            # Add color coding
-            def color_status(val):
-                if val == 'approved':
-                    return 'background-color: #d4edda'
-                elif val == 'pending':
-                    return 'background-color: #fff3cd'
-                elif val == 'rejected':
-                    return 'background-color: #f8d7da'
-                return ''
             
             st.dataframe(df_display, use_container_width=True)
             
@@ -591,6 +611,51 @@ def show_admin_panel():
             - 🟡 Pending: {len(df[df['status'] == 'pending'])} users
             - 🔴 Rejected: {len(df[df['status'] == 'rejected'])} users
             """)
+    
+    with tab3:
+        st.markdown("### 📜 Application Logs")
+        st.info("View recent application logs (last 1000 lines)")
+        
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            if st.button("🔄 Refresh Logs"):
+                st.rerun()
+        
+        try:
+            if os.path.exists('logs/app.log'):
+                with open('logs/app.log', 'r') as f:
+                    # Read last 1000 lines
+                    lines = f.readlines()
+                    recent_logs = ''.join(lines[-1000:])
+                
+                # Filter options
+                log_filter = st.selectbox(
+                    "Filter by level:",
+                    ["All", "ERROR", "WARNING", "INFO"]
+                )
+                
+                if log_filter != "All":
+                    filtered_lines = [line for line in lines[-1000:] if log_filter in line]
+                    recent_logs = ''.join(filtered_lines)
+                
+                st.code(recent_logs, language="log")
+                
+                # Download button
+                st.download_button(
+                    label="⬇️ Download Full Log",
+                    data=open('logs/app.log', 'r').read(),
+                    file_name=f"app_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+                    mime="text/plain"
+                )
+            else:
+                st.warning("No log file found yet. Logs will appear after first task execution.")
+        except Exception as e:
+            st.error(f"Error reading logs: {str(e)}")
+
+# ===== CHECK AUTHENTICATION =====
+if not st.session_state.authenticated:
+    show_login_page()
+    st.stop()
 
 # ===== SIDEBAR =====
 with st.sidebar:
@@ -659,6 +724,7 @@ elif page == "🆕 New Task":
         st.markdown("---")
         st.markdown(f"### ⚙️ Processing: `{task_id}`")
         run_task(task_id, params)
+
 elif page == "📊 My Tasks":
     st.title("📊 My Tasks")
     
@@ -673,7 +739,6 @@ elif page == "📊 My Tasks":
         st.info("No tasks yet!")
     else:
         for task in tasks:
-            # Updated status emoji to include cancelled
             status_emoji = {
                 "queued": "⏳", 
                 "started": "🔄", 
@@ -689,6 +754,7 @@ elif page == "📊 My Tasks":
                     st.markdown(f"**Task ID:** `{task['task_id']}`")
                     st.markdown(f"**Client:** {task['client_id']}")
                     st.markdown(f"**Category:** {task['category_types']}")
+                    st.markdown(f"**Dataset ID:** {task['dataset_id']}")
                 
                 with col2:
                     st.markdown(f"**Status:** {task['status']}")
@@ -708,8 +774,9 @@ elif page == "📊 My Tasks":
                 
                 if task["status"] == "failed" and task.get("error_message"):
                     st.error("❌ Error Details:")
-                    st.code(task["error_message"])
-                    
+                    with st.expander("View full error"):
+                        st.code(task["error_message"])
+
 elif page == "📈 Summary":
     st.title("📈 Summary")
     
@@ -728,13 +795,21 @@ elif page == "📈 Summary":
         col4.metric("❌ Failed", failed)
         col5.metric("🛑 Cancelled", cancelled)
         
-        # Add a chart if there are tasks
         if len(tasks) > 0:
             st.markdown("---")
             import pandas as pd
             
-            # Status distribution
+            # Status distribution chart
             status_counts = pd.DataFrame(tasks)['status'].value_counts()
+            st.subheader("Task Status Distribution")
             st.bar_chart(status_counts)
+            
+            # Recent tasks table
+            st.markdown("---")
+            st.subheader("Recent Tasks")
+            df = pd.DataFrame(tasks)
+            display_cols = ['version_name', 'status', 'client_id', 'dataset_id', 'created_at', 'completed_at']
+            df_display = df[display_cols].head(10)
+            st.dataframe(df_display, use_container_width=True)
     else:
         st.info("No tasks to summarize yet!")
