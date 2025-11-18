@@ -168,7 +168,7 @@ def logout():
 def show_login_page():
     st.markdown("""
         <div style='text-align: center; padding: 2rem 0;'>
-            <h1>🔄 Session Processing Tool</h1>
+            <h1>🔄 Data upload Tool (Solely built for DA Team)</h1>
             <p style='color: #666;'>Please login or request access</p>
         </div>
     """, unsafe_allow_html=True)
