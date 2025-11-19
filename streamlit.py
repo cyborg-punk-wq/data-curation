@@ -327,17 +327,11 @@ def launch_background_task(task_id, params):
         if os.name == 'nt':  # Windows
             process = subprocess.Popen(
                 [python_executable, "task_runner.py", task_id, params_file],
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             )
         else:  # Unix/Linux/Mac
             process = subprocess.Popen(
                 [python_executable, "task_runner.py", task_id, params_file],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
                 start_new_session=True
             )
         
