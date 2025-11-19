@@ -113,32 +113,8 @@ def fetch_and_sample_sessions(task_id, client_id, category_types, channel_types,
             logger.warning(f"Task {task_id}: Cancelled after fetching sessions")
             return None
         
-        # Remove duplicate session_ids
-        seen = set()
-        filtered_data = []
-        for item in all_data:
-            sess_id = item["session_id"]
-            if sess_id not in seen:
-                seen.add(sess_id)
-                filtered_data.append(item)
-        
-        logger.info(f"Task {task_id}: After deduplication: {len(filtered_data)} sessions")
-        
-        # Sample sessions per store_channel_id
-        category2sess_id = {}
-        for item in filtered_data:
-            cat_id = item["store_channel_id"]
-            category2sess_id.setdefault(cat_id, []).append(item["session_id"])
-        
-        final_sess_ids = []
-        for val in category2sess_id.values():
-            if len(val) >= sample_per_channel:
-                final_sess_ids.extend(val[-sample_per_channel:])
-        
-        sampled_data = [item for item in filtered_data if item["session_id"] in final_sess_ids]
-        logger.info(f"Task {task_id}: Total sessions sampled: {len(sampled_data)}")
-        
-        return sampled_data
+        logger.info(f"Task {task_id}: Returning {len(all_data)} sessions without additional sampling")
+        return all_data
         
     except Exception as e:
         logger.error(f"Task {task_id}: Error in fetch_and_sample_sessions: {str(e)}", exc_info=True)
