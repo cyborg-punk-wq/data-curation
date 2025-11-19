@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 from supabase import create_client
 import requests
+import traceback
 
 # ===== LOGGING SETUP =====
 def setup_logging():
@@ -39,7 +40,9 @@ def setup_logging():
     
     return logger
 
+
 logger = setup_logging()
+
 
 # ===== LOAD SECRETS =====
 def load_secrets():
@@ -50,6 +53,7 @@ def load_secrets():
         secrets = toml.load(f)
     return secrets
 
+
 secrets = load_secrets()
 supabase = create_client(
     secrets['connections']['supabase']['SUPABASE_URL'],
@@ -57,6 +61,11 @@ supabase = create_client(
 )
 APIKEY = secrets['APIKEY']
 CURATION_TOKEN = secrets['CURATION_TOKEN']
+
+# Constants
+PROCESS_SESSION_URL_TEMPLATE = "https://aicontroller.infilect.com/processed_session/{}/?infiviz_session_id={}"
+SOFTTAGS = ["brand", "variant", "sku"]
+
 
 # ===== TASK STATUS UPDATES =====
 def update_task_status(task_id, status, **kwargs):
@@ -69,6 +78,7 @@ def update_task_status(task_id, status, **kwargs):
     except Exception as e:
         logger.error(f"Error updating task {task_id} status: {str(e)}", exc_info=True)
 
+
 def is_task_cancelled(task_id):
     """Check if task has been cancelled"""
     try:
@@ -80,6 +90,160 @@ def is_task_cancelled(task_id):
         logger.error(f"Error checking cancellation for {task_id}: {str(e)}")
         return False
 
+
+# ===== STEP 1: FETCH & SAMPLE SESSIONS =====
+def fetch_and_sample_sessions(task_id, client_id, category_types, channel_types, 
+                                photo_types, end_date, start_date, sample_per_channel):
+    """Fetch and sample sessions from Infiviz"""
+    try:
+        from infiviz import Infiviz
+        
+        logger.info(f"Task {task_id}: Initializing Infiviz")
+        inf = Infiviz()
+        inf.add_variables(client_id, category_types, channel_types, photo_types, end_date, start_date)
+        
+        logger.info(f"Task {task_id}: Fetching combinations from Infiviz")
+        inf.get_combinations(processed=True)
+        
+        all_data = inf.all_sessions
+        logger.info(f"Task {task_id}: Total sessions found: {len(all_data)}")
+        
+        # Check cancellation
+        if is_task_cancelled(task_id):
+            logger.warning(f"Task {task_id}: Cancelled after fetching sessions")
+            return None
+        
+        # Remove duplicate session_ids
+        seen = set()
+        filtered_data = []
+        for item in all_data:
+            sess_id = item["session_id"]
+            if sess_id not in seen:
+                seen.add(sess_id)
+                filtered_data.append(item)
+        
+        logger.info(f"Task {task_id}: After deduplication: {len(filtered_data)} sessions")
+        
+        # Sample sessions per store_channel_id
+        category2sess_id = {}
+        for item in filtered_data:
+            cat_id = item["store_channel_id"]
+            category2sess_id.setdefault(cat_id, []).append(item["session_id"])
+        
+        final_sess_ids = []
+        for val in category2sess_id.values():
+            if len(val) >= sample_per_channel:
+                final_sess_ids.extend(val[-sample_per_channel:])
+        
+        sampled_data = [item for item in filtered_data if item["session_id"] in final_sess_ids]
+        logger.info(f"Task {task_id}: Total sessions sampled: {len(sampled_data)}")
+        
+        return sampled_data
+        
+    except Exception as e:
+        logger.error(f"Task {task_id}: Error in fetch_and_sample_sessions: {str(e)}", exc_info=True)
+        raise
+
+
+# ===== STEP 2: DOWNLOAD PROCESSED OUTPUTS =====
+def fetch_output_from_ai_controller(session_id, client_id):
+    """Fetch processed output from AI controller"""
+    payload = {"infiviz_session_id": session_id}
+    headers = {"APIKEY": APIKEY}
+    url = PROCESS_SESSION_URL_TEMPLATE.format(client_id, session_id)
+    
+    try:
+        result = requests.get(url, headers=headers, data=payload, timeout=30)
+        result.raise_for_status()
+        response_path = result.json()[0]["output"]
+        
+        try:
+            response = requests.get(response_path, timeout=30).json()
+            if response.get("status") == "success":
+                return response
+            else:
+                logger.warning(f"Session {session_id} returned non-success status")
+        except Exception as e:
+            logger.error(f"Failed to fetch JSON from {response_path} for session {session_id}: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error fetching output for session {session_id}: {str(e)}")
+    
+    return None
+
+
+def download_responses(task_id, sampled_sessions, client_id):
+    """Download processed outputs for all sampled sessions"""
+    session_ids = [s["session_id"] for s in sampled_sessions]
+    logger.info(f"Task {task_id}: Downloading processed outputs for {len(session_ids)} sessions")
+    
+    responses = []
+    failed_count = 0
+    
+    for idx, sess_id in enumerate(session_ids):
+        # Check cancellation every 10 sessions
+        if idx % 10 == 0 and is_task_cancelled(task_id):
+            logger.warning(f"Task {task_id}: Cancelled after downloading {idx}/{len(session_ids)} sessions")
+            return None
+        
+        resp = fetch_output_from_ai_controller(sess_id, client_id)
+        if resp:
+            responses.append(resp)
+        else:
+            failed_count += 1
+        
+        # Log progress every 50 sessions
+        if (idx + 1) % 50 == 0:
+            logger.info(f"Task {task_id}: Downloaded {idx + 1}/{len(session_ids)} sessions")
+    
+    logger.info(f"Task {task_id}: Total successful responses: {len(responses)}, failed: {failed_count}")
+    return responses
+
+
+# ===== STEP 3: UPLOAD TO CURATION =====
+def upload_to_curation(task_id, responses, dataset_id, version_name):
+    """Upload responses to Curation tool"""
+    try:
+        from curation import Curation
+        
+        logger.info(f"Task {task_id}: Initializing Curation tool")
+        cur = Curation()
+        cur.add_variables(dataset_id, version_name, CURATION_TOKEN, SOFTTAGS)
+        
+        logger.info(f"Task {task_id}: Uploading {len(responses)} responses to Curation")
+        
+        success_count = 0
+        failed_sessions = []
+        
+        for idx, resp in enumerate(responses):
+            # Check cancellation every 10 uploads
+            if idx % 10 == 0 and is_task_cancelled(task_id):
+                logger.warning(f"Task {task_id}: Cancelled after uploading {success_count}/{len(responses)} sessions")
+                return None
+            
+            try:
+                cur.upload2curation(resp)
+                success_count += 1
+            except Exception as e:
+                session_id = resp.get('session_id', 'unknown')
+                failed_sessions.append(session_id)
+                logger.error(f"Task {task_id}: Failed to upload session {session_id}: {str(e)}")
+            
+            # Log progress every 50 uploads
+            if (idx + 1) % 50 == 0:
+                logger.info(f"Task {task_id}: Uploaded {idx + 1}/{len(responses)} sessions")
+        
+        logger.info(f"Task {task_id}: Upload complete - {success_count} successful, {len(failed_sessions)} failed")
+        
+        return {
+            "success_count": success_count,
+            "failed_sessions": failed_sessions
+        }
+        
+    except Exception as e:
+        logger.error(f"Task {task_id}: Error in upload_to_curation: {str(e)}", exc_info=True)
+        raise
+
+
 # ===== MAIN TASK EXECUTION =====
 def execute_task(task_id, params):
     """Execute the actual task logic"""
@@ -90,76 +254,74 @@ def execute_task(task_id, params):
         # Mark as started
         update_task_status(task_id, "started", started_at=datetime.now().isoformat())
         
-        # Import your processing modules
-        from infiviz import InfiViz
-        from curation import CurationTool
-        
-        # Initialize tools
-        infiviz = InfiViz(api_key=APIKEY)
-        curation = CurationTool(token=CURATION_TOKEN)
-        
         # Check cancellation before starting
         if is_task_cancelled(task_id):
             logger.warning(f"Task {task_id} was cancelled before processing")
             return
         
-        # Step 1: Fetch session data
-        logger.info(f"Fetching sessions for task {task_id}")
-        sessions = infiviz.get_sessions(
-            client_id=params["client_id"],
-            start_date=params["start_date"],
-            end_date=params["end_date"],
-            photo_types=params["photo_types"],
-            category_types=params["category_types"],
-            channel_types=params["channel_types"]
+        # Step 1: Fetch and sample sessions
+        logger.info(f"Task {task_id}: Step 1 - Fetching and sampling sessions")
+        sampled_sessions = fetch_and_sample_sessions(
+            task_id,
+            params["client_id"],
+            params["category_types"],
+            params["channel_types"],
+            params["photo_types"],
+            params["end_date"],
+            params["start_date"],
+            params["sample_per_channel"]
         )
         
-        if is_task_cancelled(task_id):
-            logger.warning(f"Task {task_id} cancelled after fetching sessions")
+        if sampled_sessions is None:
+            logger.warning(f"Task {task_id}: Cancelled during session fetching")
             return
         
-        logger.info(f"Fetched {len(sessions)} sessions")
+        if len(sampled_sessions) == 0:
+            error_msg = "No sessions found matching the criteria"
+            logger.error(f"Task {task_id}: {error_msg}")
+            update_task_status(task_id, "failed", 
+                             completed_at=datetime.now().isoformat(),
+                             error_message=error_msg)
+            return
         
-        # Step 2: Sample sessions
-        logger.info(f"Sampling sessions for task {task_id}")
-        sampled_sessions = infiviz.sample_sessions(
-            sessions,
-            sample_per_channel=params["sample_per_channel"]
+        # Step 2: Download responses
+        logger.info(f"Task {task_id}: Step 2 - Downloading processed outputs")
+        responses = download_responses(task_id, sampled_sessions, params["client_id"])
+        
+        if responses is None:
+            logger.warning(f"Task {task_id}: Cancelled during response download")
+            return
+        
+        if len(responses) == 0:
+            error_msg = "No valid responses downloaded from AI controller"
+            logger.error(f"Task {task_id}: {error_msg}")
+            update_task_status(task_id, "failed",
+                             completed_at=datetime.now().isoformat(),
+                             error_message=error_msg)
+            return
+        
+        # Step 3: Upload to curation
+        logger.info(f"Task {task_id}: Step 3 - Uploading to curation")
+        upload_result = upload_to_curation(
+            task_id,
+            responses,
+            params["dataset_id"],
+            params["version_name"]
         )
         
-        if is_task_cancelled(task_id):
-            logger.warning(f"Task {task_id} cancelled after sampling")
-            return
-        
-        logger.info(f"Sampled {len(sampled_sessions)} sessions")
-        
-        # Step 3: Process and upload
-        logger.info(f"Processing images for task {task_id}")
-        processed_data = infiviz.process_images(sampled_sessions)
-        
-        if is_task_cancelled(task_id):
-            logger.warning(f"Task {task_id} cancelled after processing")
-            return
-        
-        logger.info(f"Uploading to curation tool for task {task_id}")
-        upload_result = curation.upload_dataset(
-            dataset_id=params["dataset_id"],
-            version_name=params["version_name"],
-            data=processed_data
-        )
-        
-        if is_task_cancelled(task_id):
-            logger.warning(f"Task {task_id} cancelled after upload")
+        if upload_result is None:
+            logger.warning(f"Task {task_id}: Cancelled during upload")
             return
         
         # Create result summary
         result_summary = {
-            "total_sessions": len(sessions),
-            "sampled_sessions": len(sampled_sessions),
-            "processed_images": len(processed_data),
-            "upload_status": upload_result.get("status", "unknown"),
+            "total_sessions": len(sampled_sessions),
+            "downloaded_responses": len(responses),
+            "uploaded_successfully": upload_result["success_count"],
+            "failed_uploads": len(upload_result["failed_sessions"]),
             "dataset_id": params["dataset_id"],
-            "version_name": params["version_name"]
+            "version_name": params["version_name"],
+            "client_id": params["client_id"]
         }
         
         # Mark as completed
@@ -174,13 +336,15 @@ def execute_task(task_id, params):
         logger.info(f"Result: {json.dumps(result_summary, indent=2)}")
         
     except Exception as e:
-        logger.error(f"Task {task_id} failed: {str(e)}", exc_info=True)
+        error_msg = f"{str(e)}\n\n{traceback.format_exc()}"
+        logger.error(f"Task {task_id} failed: {error_msg}")
         update_task_status(
             task_id,
             "failed",
             completed_at=datetime.now().isoformat(),
-            error_message=str(e)
+            error_message=error_msg
         )
+
 
 def main():
     """Main entry point for background task runner"""
@@ -214,6 +378,7 @@ def main():
         sys.exit(1)
     
     logger.info(f"Task runner finished for task: {task_id}")
+
 
 if __name__ == "__main__":
     main()
